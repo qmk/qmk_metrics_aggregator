@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Aggregate metrics and report them to graphite once/minute.
+"""
+import json
+import socket
+from datetime import datetime
+from os import environ
+from pathlib import Path
+from threading import Lock, Thread
+from time import sleep, time
+from traceback import print_exc
+
+import graphyte
+
+DEBUG = int(environ.get('DEBUG', '2'))
+LISTEN_HOST = environ.get('LISTEN_HOST', '0.0.0.0')
+LISTEN_PORT = environ.get('LISTEN_PORT', 2023)
+GRAPHITE_HOST = environ.get('GRAPHITE_HOST', 'graphite')
+GRAPHITE_RESOLUTION = int(environ.get('GRAPHITE_RESOLUTION', 60))
+
+# Format: sensor_data[metric_name] = [last_updated_timestamp, value]
+lock = Lock()
+sensor_data = {}
+
+def listener():
+    """Listen for graphite metrics and aggregate them.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((LISTEN_HOST, LISTEN_PORT))
+        s.listen()
+        while True:
+            conn, addr = s.accept()
+            print('Graphite connection from', addr)
+            Thread(target=processor, name=f'graphite_processor_{addr[0]}_{addr[1]}', args=(conn, addr), daemon=True).start()
+
+
+def processor(conn, addr):
+    """Process a graphite connection.
+    """
+    with conn.makefile(buffering=1, encoding='utf-8') as client:
+        for line in client:
+            # Extract the metric from this line
+            try:
+                metric, value, timestamp = line.strip().split()
+            except Exception as e:
+                print(f'Error: {e.__class__.__name__}: {e}')
+
+            hostname, service, url, rest = metric.split('.', 3)
+
+            # Skip processing time and size metrics from flask_graphite
+            if rest in ['pt', 'size']:
+                continue
+
+            # Build and store our new metric
+            metric = f'{service}.{url}.{rest}'
+
+            if metric not in sensor_data:
+                lock.acquire()
+                sensor_data[metric] = [0, 0]
+                lock.release()
+
+            lock.acquire()
+            sensor_data[metric][0] = int(time())
+            sensor_data[metric][1] += float(value)
+            lock.release()
+
+            if DEBUG > 2:
+                print(f'{addr}: {metric} += {value}')
+
+
+if __name__ == '__main__':
+    # Initiate the graphite client
+    graphyte.init(GRAPHITE_HOST)
+
+    # Start the graphite listener thread
+    Thread(target=listener, name='mqtt_read', daemon=True).start()
+
+    while True:
+        start_time = time()
+        next_loop_time = start_time + GRAPHITE_RESOLUTION
+
+        print('Sending metrics for', sorted(sensor_data.keys()))
+
+        for metric_name, ts_value in sensor_data.items():
+            graphite_metric_name = metric_name.replace('|', '_').replace('/', '_')
+            timestamp, value = ts_value
+
+            if DEBUG > 1:
+                print('sent metric to graphite:', graphite_metric_name, value)
+
+            lock.acquire()
+            graphyte.send(graphite_metric_name, value)
+            sensor_data[metric_name][1] = 0
+            lock.release()
+
+        sleep_time = next_loop_time - time()
+
+        if sleep_time > 0:
+            print(f'Sleeping {sleep_time} seconds.')
+            sleep(sleep_time)
