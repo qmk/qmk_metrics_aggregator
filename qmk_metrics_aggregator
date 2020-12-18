@@ -13,14 +13,17 @@ from traceback import print_exc
 import graphyte
 
 DEBUG = int(environ.get('DEBUG', '2'))
+AVERAGE_METRIC_KEYS = environ.get('AVERAGE_METRIC_KEYS', 'pt,size,compile_time,git_time,submodule_time,compile_time,storage_time,total_time').split(',')
 LISTEN_HOST = environ.get('LISTEN_HOST', '0.0.0.0')
 LISTEN_PORT = environ.get('LISTEN_PORT', 2023)
 GRAPHITE_HOST = environ.get('GRAPHITE_HOST', 'graphite')
 GRAPHITE_RESOLUTION = int(environ.get('GRAPHITE_RESOLUTION', 60))
 
-# Format: sensor_data[metric_name] = [last_updated_timestamp, value]
-lock = Lock()
+# Two possible formats for sensor data.
+# Summed data: sensor_data[metric_name] = [last_updated_timestamp, value]
+# Averaged data: sensor_data[metric_name] = [last_updated_timestamp, sum, count]
 sensor_data = {}
+lock = Lock()
 
 def listener():
     """Listen for graphite metrics and aggregate them.
@@ -46,22 +49,21 @@ def processor(conn, addr):
                 print(f'Error: {e.__class__.__name__}: {e}')
 
             hostname, service, url, rest = metric.split('.', 3)
-
-            # Skip processing time and size metrics from flask_graphite
-            if rest in ['pt', 'size']:
-                continue
+            metric_type = 'avg' if rest in AVERAGE_METRIC_KEYS else 'sum'
 
             # Build and store our new metric
             metric = f'{service}.{url}.{rest}'
 
             if metric not in sensor_data:
                 lock.acquire()
-                sensor_data[metric] = [0, 0]
+                sensor_data[metric] = [False, 0, 0]
                 lock.release()
 
             lock.acquire()
             sensor_data[metric][0] = int(time())
             sensor_data[metric][1] += float(value)
+            if metric_type == 'avg':
+                sensor_data[metric][2] += 1
             lock.release()
 
             if DEBUG > 2:
@@ -75,22 +77,45 @@ if __name__ == '__main__':
     # Start the graphite listener thread
     Thread(target=listener, name='mqtt_read', daemon=True).start()
 
+    to_remove = []
+
     while True:
         start_time = time()
         next_loop_time = start_time + GRAPHITE_RESOLUTION
 
         print('Sending metrics for', sorted(sensor_data.keys()))
 
+        for metric_name in to_remove:
+            if not sensor_data[metric_name][0]:
+                if DEBUG > 1:
+                    print('removing non-updated metric', metric_name)
+                lock.acquire()
+                del sensor_data[metric_name]
+                lock.release()
+
+        to_remove = []
+
         for metric_name, ts_value in sensor_data.items():
             graphite_metric_name = metric_name.replace('|', '_').replace('/', '_')
-            timestamp, value = ts_value
+            timestamp, sum, count = ts_value
+
+            if count > 0:
+                value = sum / count
+            else:
+                value = sum
+
+            if not timestamp:
+                if DEBUG > 1:
+                    print('skipping non-updated metric', metric_name)
+                to_remove.append(metric_name)
+                continue
 
             if DEBUG > 1:
-                print('sent metric to graphite:', graphite_metric_name, value)
+                print('sending metric to graphite:', graphite_metric_name, value)
 
             lock.acquire()
             graphyte.send(graphite_metric_name, value)
-            sensor_data[metric_name][1] = 0
+            sensor_data[metric_name] = [False, 0, 0]
             lock.release()
 
         sleep_time = next_loop_time - time()
