@@ -44,5 +44,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/qmk/qmk_graphite:latest
-            qmkfm/qmk_graphite:latest
+            ghcr.io/qmk/qmk_metrics_aggregator:latest
+            qmkfm/qmk_metrics_aggregator:latest
